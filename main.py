@@ -4,7 +4,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
-import google.generativeai as genai
+from google import genai
 
 app = FastAPI()
 
@@ -16,10 +16,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configura Google Gemini con la chiave d'ambiente
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
+# Inizializza il client di Google GenAI leggendo la chiave dalle variabili d'ambiente
+client = None
+api_key = os.environ.get("GOOGLE_API_KEY")
+if api_key:
+    client = genai.Client(api_key=api_key)
 
 RSS_URLS = {
     "ANSA": "https://www.ansa.it/sito/ansait_rss.xml",
@@ -65,10 +66,16 @@ TITOLI:
 {evidence_text}
 """
 
+    briefing_content = ""
     try:
-       model = genai.GenerativeModel('gemini-flash-latest')
-        response = model.generate_content(prompt)
-        briefing_content = response.text
+        if client:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt
+            )
+            briefing_content = response.text
+        else:
+            briefing_content = "Errore: GOOGLE_API_KEY non configurata."
     except Exception as e:
         briefing_content = f"Errore nella generazione con Google Gemini: {e}"
 
