@@ -16,11 +16,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inizializza il client di Google GenAI leggendo la chiave dalle variabili d'ambiente
-client = None
+# Legge la chiave in modo sicuro dalle variabili d'ambiente di Render
 api_key = os.environ.get("GOOGLE_API_KEY")
-if api_key:
-    client = genai.Client(api_key=api_key)
+client = genai.Client(api_key=api_key) if api_key else None
 
 RSS_URLS = {
     "ANSA": "https://www.ansa.it/sito/ansait_rss.xml",
@@ -70,12 +68,12 @@ TITOLI:
     try:
         if client:
             response = client.models.generate_content(
-                model='gemini-3.8-flash',
+                model='gemini-2.5-flash',
                 contents=prompt
             )
             briefing_content = response.text
         else:
-            briefing_content = "Errore: GOOGLE_API_KEY non configurata."
+            briefing_content = "Errore: GOOGLE_API_KEY non configurata nelle variabili d'ambiente."
     except Exception as e:
         briefing_content = f"Errore nella generazione con Google Gemini: {e}"
 
