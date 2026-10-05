@@ -66,7 +66,7 @@ TITOLI:
 """
 
     try:
-       model = genai.GenerativeModel('gemini-pro')
+       model = genai.GenerativeModel('gemini-flash-latest')
         response = model.generate_content(prompt)
         briefing_content = response.text
     except Exception as e:
