@@ -1,84 +1,59 @@
-import asyncio
-import feedparser
-import httpx
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 import os
 from google import genai
+from google.genai import errors
 
-app = FastAPI()
+def genera_rassegna_stampa(testi_notizie):
+    """
+    Genera la rassegna stampa in modo sicuro, intercettando qualsiasi errore.
+    """
+    # 1. CONTROLLO PREVENTIVO DELLA CHIAVE API
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return "⚠️ ERRORE DI SISTEMA: La variabile GOOGLE_API_KEY non è configurata su Render. Aggiungila nelle impostazioni di Environment."
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Legge la chiave in modo sicuro dalle variabili d'ambiente di Render
-api_key = os.environ.get("GOOGLE_API_KEY")
-client = genai.Client(api_key=api_key) if api_key else None
-
-RSS_URLS = {
-    "ANSA": "https://www.ansa.it/sito/ansait_rss.xml",
-    "RaiNews": "https://www.rainews.it/rss",
-    "Il Sole 24 Ore": "https://www.ilsole24ore.com/rss/italia.xml",
-    "Corriere": "https://www.corriere.it/rss/homepage.xml",
-    "BBC World": "http://feeds.bbci.co.uk/news/world/rss.xml"
-}
-
-async def fetch_feed(client_http: httpx.AsyncClient, name: str, url: str):
+    # 2. INIZIALIZZAZIONE SICURA DEL CLIENT
     try:
-        response = await client_http.get(url, timeout=5.0)
-        if response.status_code == 200:
-            feed = feedparser.parse(response.text)
-            articles = []
-            for entry in feed.entries[:5]:
-                articles.append({
-                    "title": entry.get("title", ""),
-                    "url": entry.get("link", ""),
-                    "source": name
-                })
-            return articles
-    except Exception:
-        pass
-    return []
-
-@app.get("/api/briefing")
-async def get_briefing():
-    async with httpx.AsyncClient(follow_redirects=True) as client_http:
-        tasks = [fetch_feed(client_http, name, url) for name, url in RSS_URLS.items()]
-        results = await asyncio.gather(*tasks)
-        all_articles = [art for sublist in results for art in sublist]
-
-    evidence_text = ""
-    for i, art in enumerate(all_articles[:15], 1):
-        evidence_text += f"{i}. [{art['source']}] {art['title']} - Link: {art['url']}\n"
-
-    prompt = f"""
-Sei il curatore di una rassegna stampa professionale. Basandoti ESCLUSIVAMENTE sui seguenti titoli, genera un briefing sintetico e discorsivo in italiano. 
-Per ogni notizia cita la testata e inserisci il link originale fornito. Non inventare nulla.
-
-TITOLI:
-{evidence_text}
-"""
-
-    briefing_content = ""
-    try:
-        if client:
-            response = client.models.generate_content(
-                model='gemini-3.8-flash',
-                contents=prompt
-            )
-            briefing_content = response.text
-        else:
-            briefing_content = "Errore: GOOGLE_API_KEY non configurata nelle variabili d'ambiente."
+        # Passiamo la chiave esplicitamente per evitare ambiguità
+        client = genai.Client(api_key=api_key)
     except Exception as e:
-        briefing_content = f"Errore nella generazione con Google Gemini: {e}"
+        return f"⚠️ ERRORE DI INIZIALIZZAZIONE: Impossibile avviare il client Google. Dettaglio: {str(e)}"
 
-    return {
-        "status": "success",
-        "briefing": briefing_content,
-        "total_articles": len(all_articles)
-    }
+    # 3. PROMPT STRUTTURATO PER IL COMPITO GIORNALISTICO
+    # Qui definiamo esattamente come l'AI deve comportarsi
+    prompt = f"""Sei un caporedattore esperto e un giornalista professionista.
+Il tuo compito è creare una rassegna stampa istituzionale, chiara e impeccabile partendo dalle notizie fornite.
+
+REGOLE FONDAMENTALI:
+1. Tono: Giornalistico, oggettivo, formale.
+2. Struttura: Assegna un Titolo in grassetto per ogni notizia, seguito da un riassunto conciso dei fatti chiave.
+3. Accuratezza: Massima attenzione all'ortografia, all'uso corretto degli accenti e alla punteggiatura. Niente refusi.
+4. Neutralità: Riporta i fatti, non aggiungere commenti o pareri personali.
+
+NOTIZIE DA SINTETIZZARE:
+{testi_notizie}
+
+Genera la rassegna stampa:"""
+
+    # 4. CHIAMATA ALL'API CON RETE DI SALVATAGGIO (TRY/EXCEPT)
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', # Puoi usare gemini-2.5-pro per analisi più complesse
+            contents=prompt,
+        )
+        # Se la generazione va a buon fine, restituisce il testo
+        return response.text
+
+    # Gestisce gli errori specifici di Google (es. server down, limite di richieste superato)
+    except errors.APIError as e:
+        return f"⚠️ ERRORE API GOOGLE: Si è verificato un problema di comunicazione con Gemini. Dettaglio: {e.message}"
+    
+    # Gestisce qualsiasi altro errore imprevisto senza far crashare l'app
+    except Exception as e:
+        return f"⚠️ ERRORE IMPREVISTO DURANTE LA GENERAZIONE: {str(e)}"
+
+
+# ESEMPIO DI UTILIZZO NEL TUO ENDPOINT (FastAPI, Flask, ecc.):
+# 
+# notizie_grezze = "..."
+# risultato = genera_rassegna_stampa(notizie_grezze)
+# return {"rassegna": risultato}
