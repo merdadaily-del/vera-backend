@@ -3,4 +3,5 @@ uvicorn
 feedparser
 httpx
 beautifulsoup4
+rapidfuzz
 openai
