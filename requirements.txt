@@ -1,6 +1,10 @@
 fastapi
-uvicorn
-feedparser
+uvicorn[standard]
 httpx
+feedparser
+rapidfuzz
+pydantic
+groq
 google-genai
-python-dotenv
+sqlalchemy
+psycopg[binary]

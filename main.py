@@ -1,59 +1,182 @@
+import asyncio
 import os
-from google import genai
-from google.genai import errors
+from datetime import datetime, timezone
+from typing import Optional
 
-def genera_rassegna_stampa(testi_notizie):
-    """
-    Genera la rassegna stampa in modo sicuro, intercettando qualsiasi errore.
-    """
-    # 1. CONTROLLO PREVENTIVO DELLA CHIAVE API
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        return "⚠️ ERRORE DI SISTEMA: La variabile GOOGLE_API_KEY non è configurata su Render. Aggiungila nelle impostazioni di Environment."
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-    # 2. INIZIALIZZAZIONE SICURA DEL CLIENT
+from feeds import FEEDS
+from rss import fetch_all
+from clustering import cluster_articles
+from ai import verify_event, build_briefing, AIError
+
+
+app = FastAPI(title="VERA Editorial Backend", version="2.0")
+
+frontend_url = os.getenv("FRONTEND_URL", "*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if frontend_url == "*" else [frontend_url],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+STATE = {
+    "articles": [],
+    "events": [],
+    "briefing": None,
+    "last_refresh": None,
+    "refreshing": False,
+    "last_error": None,
+}
+
+
+class BriefingRequest(BaseModel):
+    interests: list[str] = Field(default_factory=list)
+    max_items: int = Field(default=8, ge=3, le=15)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def refresh_pipeline(interests: Optional[list[str]] = None, max_items: int = 8):
+    if STATE["refreshing"]:
+        return STATE["briefing"]
+
+    STATE["refreshing"] = True
+    STATE["last_error"] = None
+
     try:
-        # Passiamo la chiave esplicitamente per evitare ambiguità
-        client = genai.Client(api_key=api_key)
-    except Exception as e:
-        return f"⚠️ ERRORE DI INIZIALIZZAZIONE: Impossibile avviare il client Google. Dettaglio: {str(e)}"
+        # 1. RSS paralleli
+        articles = await fetch_all(FEEDS)
 
-    # 3. PROMPT STRUTTURATO PER IL COMPITO GIORNALISTICO
-    # Qui definiamo esattamente come l'AI deve comportarsi
-    prompt = f"""Sei un caporedattore esperto e un giornalista professionista.
-Il tuo compito è creare una rassegna stampa istituzionale, chiara e impeccabile partendo dalle notizie fornite.
+        # 2. Clustering locale: nessuna richiesta AI
+        events = cluster_articles(articles)
 
-REGOLE FONDAMENTALI:
-1. Tono: Giornalistico, oggettivo, formale.
-2. Struttura: Assegna un Titolo in grassetto per ogni notizia, seguito da un riassunto conciso dei fatti chiave.
-3. Accuratezza: Massima attenzione all'ortografia, all'uso corretto degli accenti e alla punteggiatura. Niente refusi.
-4. Neutralità: Riporta i fatti, non aggiungere commenti o pareri personali.
+        # 3. Seleziona candidati: fonti multiple + freschezza.
+        candidates = []
+        for event in events:
+            outlets = {a["outlet"] for a in event["articles"]}
+            if len(event["articles"]) >= 2 or len(outlets) >= 2:
+                candidates.append(event)
 
-NOTIZIE DA SINTETIZZARE:
-{testi_notizie}
+        # Evita di mandare centinaia di eventi all'AI.
+        candidates = candidates[:30]
 
-Genera la rassegna stampa:"""
+        # 4. Verifica solo i candidati più importanti.
+        verified = []
+        for event in candidates:
+            try:
+                event["verification"] = verify_event(event)
+                status = event["verification"].get("status")
+                if status in {"CONFIRMED", "REPORTED"}:
+                    verified.append(event)
+            except AIError:
+                # Se l'AI non è disponibile, non inventiamo una verifica.
+                continue
 
-    # 4. CHIAMATA ALL'API CON RETE DI SALVATAGGIO (TRY/EXCEPT)
+        # 5. Rassegna finale
+        if verified:
+            briefing = build_briefing(
+                verified[:20],
+                interests or [],
+            )
+        else:
+            briefing = {
+                "headline": "VERA non ha ancora una rassegna verificata",
+                "intro": "Le fonti sono state aggiornate, ma non ci sono abbastanza elementi verificati per costruire una rassegna affidabile.",
+                "items": [],
+            }
+
+        STATE["articles"] = articles
+        STATE["events"] = verified
+        STATE["briefing"] = {
+            **briefing,
+            "created_at": now_iso(),
+            "source_count": len(articles),
+            "event_count": len(verified),
+            "provider": "groq-primary/gemini-fallback",
+        }
+        STATE["last_refresh"] = now_iso()
+        return STATE["briefing"]
+
+    except Exception as exc:
+        STATE["last_error"] = str(exc)
+        raise
+    finally:
+        STATE["refreshing"] = False
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "VERA Editorial Backend",
+        "status": "ok",
+        "feeds": len(FEEDS),
+        "last_refresh": STATE["last_refresh"],
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "feeds": len(FEEDS),
+        "last_refresh": STATE["last_refresh"],
+        "refreshing": STATE["refreshing"],
+        "last_error": STATE["last_error"],
+    }
+
+
+@app.get("/v1/briefing")
+def get_briefing():
+    return {
+        "briefing": STATE["briefing"],
+        "last_refresh": STATE["last_refresh"],
+        "refreshing": STATE["refreshing"],
+    }
+
+
+@app.post("/v1/briefing")
+async def create_briefing(request: BriefingRequest):
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash', # Puoi usare gemini-2.5-pro per analisi più complesse
-            contents=prompt,
-        )
-        # Se la generazione va a buon fine, restituisce il testo
-        return response.text
-
-    # Gestisce gli errori specifici di Google (es. server down, limite di richieste superato)
-    except errors.APIError as e:
-        return f"⚠️ ERRORE API GOOGLE: Si è verificato un problema di comunicazione con Gemini. Dettaglio: {e.message}"
-    
-    # Gestisce qualsiasi altro errore imprevisto senza far crashare l'app
-    except Exception as e:
-        return f"⚠️ ERRORE IMPREVISTO DURANTE LA GENERAZIONE: {str(e)}"
+        briefing = await refresh_pipeline(request.interests, request.max_items)
+        return {"briefing": briefing}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
-# ESEMPIO DI UTILIZZO NEL TUO ENDPOINT (FastAPI, Flask, ecc.):
-# 
-# notizie_grezze = "..."
-# risultato = genera_rassegna_stampa(notizie_grezze)
-# return {"rassegna": risultato}
+@app.post("/v1/refresh")
+async def refresh(request: BriefingRequest = BriefingRequest()):
+    # Primo avvio: aspetta il risultato.
+    # Chiamate successive: il frontend può mostrare il briefing precedente
+    # mentre questa pipeline aggiorna i dati.
+    if STATE["briefing"] is None:
+        return {"briefing": await refresh_pipeline(request.interests, request.max_items)}
+
+    if not STATE["refreshing"]:
+        asyncio.create_task(refresh_pipeline(request.interests, request.max_items))
+
+    return {
+        "accepted": True,
+        "message": "Aggiornamento avviato",
+        "last_briefing": STATE["briefing"],
+        "last_refresh": STATE["last_refresh"],
+    }
+
+
+@app.get("/v1/events")
+def get_events(limit: int = Query(default=20, ge=1, le=100)):
+    return {
+        "events": STATE["events"][:limit],
+        "last_refresh": STATE["last_refresh"],
+    }
+
+
+@app.get("/v1/sources")
+def get_sources():
+    return {"sources": FEEDS, "count": len(FEEDS)}
