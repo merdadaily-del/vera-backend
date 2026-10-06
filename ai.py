@@ -2,24 +2,18 @@ import json
 import os
 from typing import Any
 
-from groq import Groq
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 
-GROQ_MODEL_FAST = os.getenv(
-    "GROQ_MODEL_FAST",
-    "openai/gpt-oss-20b"
-)
+# ============================================================
+# VERA - DEEPSEEK ONLY
+# ============================================================
 
-GROQ_MODEL_DEEP = os.getenv(
-    "GROQ_MODEL_DEEP",
-    "openai/gpt-oss-120b"
-)
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
+DEEPSEEK_MODEL = os.getenv(
+    "DEEPSEEK_MODEL",
+    "deepseek-flash"
 )
 
 
@@ -27,219 +21,301 @@ class AIError(Exception):
     pass
 
 
-def _json_from_text(text: str) -> dict[str, Any]:
-    text = (text or "").strip()
+# ============================================================
+# DEEPSEEK CLIENT
+# ============================================================
+
+def get_client() -> OpenAI:
+
+    if not DEEPSEEK_API_KEY:
+        raise AIError(
+            "DEEPSEEK_API_KEY non configurata su Render"
+        )
+
+    return OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com"
+    )
+
+
+# ============================================================
+# JSON PARSER
+# ============================================================
+
+def parse_json(text: str) -> dict[str, Any]:
+
+    if not text:
+        raise AIError(
+            "DeepSeek ha restituito una risposta vuota"
+        )
+
+    text = text.strip()
+
+    # Gestisce eventuale risposta:
+    # ```json
+    # {...}
+    # ```
 
     if text.startswith("```"):
-        text = text.strip("`")
 
-        if text.startswith("json"):
-            text = text[4:].strip()
+        lines = text.splitlines()
+
+        if lines:
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        text = "\n".join(lines).strip()
 
     try:
-        return json.loads(text)
+
+        data = json.loads(text)
 
     except Exception as exc:
+
         raise AIError(
-            f"Risposta AI non valida come JSON: {exc}"
+            f"Risposta DeepSeek non valida come JSON: {exc}"
         ) from exc
 
+    if not isinstance(data, dict):
 
-def _groq(
-    prompt: str,
-    model: str,
-    max_tokens: int = 700
-) -> dict[str, Any]:
-
-    key = os.getenv("GROQ_API_KEY")
-
-    if not key:
         raise AIError(
-            "GROQ_API_KEY non configurata"
+            "DeepSeek ha restituito un JSON non valido"
         )
 
-    client = Groq(api_key=key)
-
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        max_tokens=max_tokens,
-
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Sei il motore editoriale di VERA. "
-                    "Non inventare fatti. "
-                    "Usa esclusivamente le fonti fornite. "
-                    "Distingui fatti, dichiarazioni, accuse "
-                    "e interpretazioni. "
-                    "Rispondi SOLO con JSON valido."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-
-        response_format={
-            "type": "json_object"
-        },
-    )
-
-    return _json_from_text(
-        response.choices[0].message.content
-    )
+    return data
 
 
-def _gemini(
-    prompt: str,
-    max_tokens: int = 700
-) -> dict[str, Any]:
-
-    key = (
-        os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-    )
-
-    if not key:
-        raise AIError(
-            "GEMINI_API_KEY/GOOGLE_API_KEY non configurata"
-        )
-
-    client = genai.Client(api_key=key)
-
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-
-        config=types.GenerateContentConfig(
-            temperature=0.1,
-            max_output_tokens=max_tokens,
-            response_mime_type="application/json",
-        ),
-    )
-
-    return _json_from_text(response.text)
-
+# ============================================================
+# CHIAMATA DEEPSEEK
+# ============================================================
 
 def generate_json(
     prompt: str,
-    deep: bool = False
+    max_tokens: int = 2000
 ) -> dict[str, Any]:
 
-    # Per VERA usiamo il modello veloce anche
-    # nelle operazioni che prima usavano il 120B.
-    #
-    # Il motivo è il limite TPM gratuito di Groq:
-    # 8000 token/minuto.
-
-    groq_model = GROQ_MODEL_FAST
+    client = get_client()
 
     try:
 
-        return _groq(
-            prompt,
-            groq_model,
-            max_tokens=700
+        response = client.chat.completions.create(
+
+            model=DEEPSEEK_MODEL,
+
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+Sei VERA, un motore editoriale giornalistico.
+
+Usa esclusivamente le informazioni contenute
+nelle fonti che ti vengono fornite.
+
+Non inventare fatti, nomi, date, numeri,
+luoghi, dichiarazioni o collegamenti.
+
+Distingui sempre tra:
+- fatti;
+- dichiarazioni;
+- accuse;
+- informazioni riportate;
+- interpretazioni.
+
+Quando una notizia non può essere confermata,
+devi indicarlo chiaramente.
+
+Devi rispondere esclusivamente in formato JSON.
+"""
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+
+            temperature=0.1,
+
+            max_tokens=max_tokens,
+
+            response_format={
+                "type": "json_object"
+            }
         )
 
-    except Exception as groq_error:
+    except Exception as exc:
 
-        try:
+        raise AIError(
+            f"Errore API DeepSeek: {exc}"
+        ) from exc
 
-            return _gemini(
-                prompt,
-                max_tokens=700
-            )
+    if not response.choices:
 
-        except Exception as gemini_error:
+        raise AIError(
+            "DeepSeek non ha restituito alcuna scelta"
+        )
 
-            raise AIError(
-                f"Groq fallito ({groq_error}); "
-                f"Gemini fallback fallito ({gemini_error})"
-            ) from gemini_error
+    message = response.choices[0].message
+
+    content = message.content
+
+    if not content:
+
+        raise AIError(
+            "DeepSeek ha restituito contenuto vuoto"
+        )
+
+    return parse_json(content)
 
 
-def _compact_sources(
-    sources: list[dict[str, Any]],
+# ============================================================
+# COMPRESSIONE DELLE FONTI
+# ============================================================
+
+def compact_sources(
+    articles: list[dict[str, Any]],
     max_sources: int = 3
 ) -> list[dict[str, Any]]:
 
-    compact = []
+    result = []
 
-    for article in sources[:max_sources]:
+    for article in articles[:max_sources]:
 
-        compact.append({
-            "id": article["id"],
-            "outlet": article["outlet"],
-            "published": article["published"],
-            "title": article["title"][:300],
-            "summary": article.get(
-                "summary",
-                ""
-            )[:400],
+        result.append({
+
+            "id": article.get("id"),
+
+            "outlet": article.get("outlet"),
+
+            "published": article.get("published"),
+
+            "title": str(
+                article.get("title", "")
+            )[:300],
+
+            "summary": str(
+                article.get("summary", "")
+            )[:600]
+
         })
 
-    return compact
+    return result
 
+
+# ============================================================
+# VERIFICA EDITORIALE
+# ============================================================
 
 def verify_event(
     event: dict[str, Any]
 ) -> dict[str, Any]:
 
-    # Massimo 3 fonti per evento.
-    sources = _compact_sources(
-        event["articles"],
+    sources = compact_sources(
+        event.get("articles", []),
         max_sources=3
     )
 
+    event_info = {
+
+        "id": event.get("id"),
+
+        "title": str(
+            event.get("title", "")
+        )[:400],
+
+        "category": event.get(
+            "category",
+            ""
+        )
+
+    }
+
     prompt = f"""
-VERIFICA EDITORIALE VERA.
+VERIFICA EDITORIALE VERA
 
-Verifica l'evento usando SOLO le fonti fornite.
+Devi verificare l'evento giornalistico
+descritto sotto.
 
-Regole:
-- non usare conoscenze esterne;
-- non considerare automaticamente vere le informazioni;
-- distingui fatti e dichiarazioni;
-- se non c'è conferma sufficiente usa REPORTED;
-- usa CONFIRMED solo quando l'evidenza è sufficiente;
-- usa UNVERIFIED quando non è possibile stabilire il fatto;
-- non inventare informazioni.
+USA ESCLUSIVAMENTE LE FONTI FORNITE.
+
+NON usare conoscenze esterne.
+
+REGOLE:
+
+1. Una notizia non è automaticamente vera
+   solo perché viene riportata da una fonte.
+
+2. Distingui tra:
+   - fatto;
+   - dichiarazione;
+   - accusa;
+   - interpretazione.
+
+3. Usa CONFIRMED quando le fonti forniscono
+   elementi sufficienti per considerare
+   il fatto confermato.
+
+4. Usa REPORTED quando una fonte riporta
+   il fatto ma non c'è sufficiente conferma
+   indipendente.
+
+5. Usa UNVERIFIED quando le fonti non
+   permettono di stabilire cosa sia successo.
+
+6. Non inventare informazioni mancanti.
+
+7. Non attribuire a una fonte qualcosa
+   che la fonte non dice.
+
+8. Gli ID delle fonti devono essere copiati
+   esattamente.
 
 EVENTO:
-{json.dumps({
-    "title": event["title"],
-    "category": event["category"]
-}, ensure_ascii=False)}
+
+{json.dumps(
+    event_info,
+    ensure_ascii=False
+)}
 
 FONTI:
+
 {json.dumps(
     sources,
     ensure_ascii=False
 )}
 
-Restituisci SOLO questo JSON:
+Restituisci ESCLUSIVAMENTE JSON.
+
+Formato obbligatorio:
 
 {{
-  "status": "CONFIRMED|REPORTED|UNVERIFIED",
-  "confidence": 0,
-  "confirmed_facts": [],
-  "reported_claims": [],
-  "contradictions": [],
-  "important_uncertainties": [],
-  "independent_source_ids": [],
-  "reason": ""
+    "status": "CONFIRMED",
+    "confidence": 0,
+    "confirmed_facts": [],
+    "reported_claims": [],
+    "contradictions": [],
+    "important_uncertainties": [],
+    "independent_source_ids": [],
+    "reason": ""
 }}
+
+Il campo status deve essere esattamente uno di:
+
+CONFIRMED
+REPORTED
+UNVERIFIED
 """
 
     return generate_json(
         prompt,
-        deep=False
+        max_tokens=2000
     )
 
+
+# ============================================================
+# BRIEFING VERA
+# ============================================================
 
 def build_briefing(
     events: list[dict[str, Any]],
@@ -248,91 +324,142 @@ def build_briefing(
 
     evidence = []
 
-    # MASSIMO 4 eventi nella rassegna finale.
-    #
-    # Questo è fondamentale per non superare
-    # il limite gratuito di Groq.
+    # Massimo 6 eventi nel briefing.
+    # Questo mantiene il prompt compatto.
 
-    for event in events[:4]:
+    for event in events[:6]:
 
-        sources = _compact_sources(
-            event["articles"],
+        verification = event.get(
+            "verification",
+            {}
+        )
+
+        sources = compact_sources(
+            event.get("articles", []),
             max_sources=2
         )
 
         evidence.append({
-            "event_id": event["id"],
-            "title": event["title"][:300],
-            "category": event["category"],
+
+            "event_id": event.get(
+                "id"
+            ),
+
+            "title": str(
+                event.get(
+                    "title",
+                    ""
+                )
+            )[:300],
+
+            "category": event.get(
+                "category",
+                ""
+            ),
 
             "verification": {
-                "status": event.get(
-                    "verification",
-                    {}
-                ).get("status"),
 
-                "confidence": event.get(
-                    "verification",
-                    {}
-                ).get("confidence"),
+                "status": verification.get(
+                    "status"
+                ),
 
-                "reason": event.get(
-                    "verification",
-                    {}
-                ).get("reason", "")[:300],
+                "confidence": verification.get(
+                    "confidence"
+                ),
+
+                "reason": str(
+                    verification.get(
+                        "reason",
+                        ""
+                    )
+                )[:400]
+
             },
 
-            "sources": sources,
+            "sources": sources
+
         })
 
     prompt = f"""
-SEI VERA, una rassegna stampa giornalistica.
+SEI VERA.
 
-Interessi:
-{", ".join(interests) if interests else "tutti"}
+Devi creare una rassegna stampa
+giornalistica in italiano.
 
-Crea una breve rassegna SOLO usando gli eventi forniti.
+USA ESCLUSIVAMENTE gli eventi e le fonti
+fornite.
 
-Non inventare fatti.
-Non usare informazioni esterne.
-Non copiare le frasi delle fonti.
-Scrivi in italiano giornalistico naturale.
+NON usare conoscenze esterne.
 
-Per ogni evento:
+INTERESSI:
+
+{json.dumps(
+    interests or ["tutti"],
+    ensure_ascii=False
+)}
+
+REGOLE EDITORIALI:
+
+- Non inventare informazioni.
+- Non aggiungere fatti non presenti
+  nelle fonti.
+- Non trasformare dichiarazioni
+  in fatti.
+- Mantieni le attribuzioni.
+- Se lo status è REPORTED, fai capire
+  chiaramente che la notizia è riportata
+  dalle fonti.
+- Non presentare UNVERIFIED come fatto.
+- Scrivi in italiano naturale.
+- Scrivi come una rassegna stampa
+  professionale.
+- Evita formule da chatbot.
+- Sii chiaro e sintetico.
+- Dai priorità agli eventi più importanti.
+
+Per ogni evento indica:
+
 - cosa è successo;
 - perché è importante;
-- cosa succede ora;
+- cosa cambia;
 - eventuali incertezze.
 
-Mantieni le attribuzioni quando un fatto è solo riferito.
-
 EVENTI:
+
 {json.dumps(
     evidence,
     ensure_ascii=False
 )}
 
-Restituisci SOLO JSON:
+Restituisci ESCLUSIVAMENTE JSON.
+
+Formato obbligatorio:
 
 {{
-  "headline": "",
-  "intro": "",
-  "items": [
-    {{
-      "event_id": "",
-      "title": "",
-      "what_happened": "",
-      "why_it_matters": "",
-      "what_changed": "",
-      "uncertainty": "",
-      "status": "CONFIRMED|REPORTED|UNVERIFIED",
-      "sources": []
-    }}
-  ]
+    "headline": "",
+    "intro": "",
+    "items": [
+        {{
+            "event_id": "",
+            "title": "",
+            "what_happened": "",
+            "why_it_matters": "",
+            "what_changed": "",
+            "uncertainty": "",
+            "status": "CONFIRMED",
+            "sources": []
+        }}
+    ]
 }}
+
+Lo status deve essere uno di:
+
+CONFIRMED
+REPORTED
+UNVERIFIED
 """
 
     return generate_json(
         prompt,
-        deep=False
+        max_tokens=3000
     )
